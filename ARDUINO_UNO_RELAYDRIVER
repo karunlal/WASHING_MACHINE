@@ -1,0 +1,23 @@
+// Arduino Uno as 4-channel Relay Driver for ESP32 signals
+
+int espPins[4]   = {4, 5, 6, 7};     // from ESP32
+int relayPins[4] = {8, 9, 10, 11};   // to Relay IN1–IN4
+
+void setup() {
+  for (int i = 0; i < 4; i++) {
+    pinMode(espPins[i], INPUT);
+    pinMode(relayPins[i], OUTPUT);
+    digitalWrite(relayPins[i], HIGH); // Relay OFF initially (low trigger)
+  }
+}
+
+void loop() {
+  for (int i = 0; i < 4; i++) {
+    int state = digitalRead(espPins[i]);
+    if (state == HIGH) {
+      digitalWrite(relayPins[i], LOW);   // Turn ON relay (low trigger)
+    } else {
+      digitalWrite(relayPins[i], HIGH);  // Turn OFF relay
+    }
+  }
+}
