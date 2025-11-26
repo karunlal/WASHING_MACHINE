@@ -1,23 +1,651 @@
-// Arduino Uno as 4-channel Relay Driver for ESP32 signals
+/*
+  ESP32 Washer – FINAL (Auto-resume Option A, OLED fixed)
+  - OLED init matches working test (no blank)
+  - Hybrid HX710B reader (accurate + non-freezing)
+  - Auto-resume after power failure with 5s countdown (press STOP to cancel)
+  - State saved with Preferences at major steps: stage / cycle / round
+  - All timings and motor pattern same as your last working version
+*/
 
-int espPins[4]   = {4, 5, 6, 7};     // from ESP32
-int relayPins[4] = {8, 9, 10, 11};   // to Relay IN1–IN4
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <Preferences.h>
 
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ---------- NV storage ----------
+Preferences prefs;
+
+// ---------- Relays (active LOW) ----------
+#define RELAY_INLET 26
+#define RELAY_DRAIN 25
+#define RELAY_FWD   32
+#define RELAY_REV   33
+
+// ---------- Buttons ----------
+#define BTN_START 16
+#define BTN_STOP  17
+
+// ---------- HX710B ----------
+#define HX_SCK  18
+#define HX_DOUT 19
+
+// ---------- Threshold ----------
+long threshold = 1900000; // your manual threshold
+
+// ============================
+//         WASH CYCLES
+// ============================
+int totalCycles = 3;     // Total wash cycles: 3
+int washRounds  = 30;    // Motor wash rounds per cycle: 30
+
+// ============================
+//       MOTOR PATTERN TIMES
+// ============================
+int fwdTime = 10000;     // Motor forward: 10 sec
+int pause1Time = 7000;   // Pause: 7 sec
+int revPulseTime = 3000; // Reverse pulse: 3 sec
+int revFullTime = 10000; // Full reverse: 10 sec
+int pause2Time = 10000;  // Final pause: 10 sec
+
+// ============================
+//          DURATIONS
+// ============================
+int fillTimeout = 720000; // Max fill: 720 sec (12 minutes)
+int drainTime = 180000;   // Drain: 180 sec (3 minutes)
+int cycleDelay = 30000;   // Wait between cycles: 30 sec
+
+// ============================
+//         FINAL SPIN
+// ============================
+int spinDrainBefore = 10000;  // Drain before spin: 10 sec
+int spinTime = 110000;        // Spin: 110 sec (1 min 50 sec)
+int spinMotorOff = 30000;     // Motor off drain: 30 sec
+int spinDrainAfter = 10000;   // Final drain: 10 sec
+
+// ---------- Pressure ----------
+long pressure = 0;
+long lastRawPressure = 0;
+
+// ---------- Resume state ----------
+enum Stage { ST_IDLE=0, ST_FILLING=1, ST_WASHING=2, ST_DRAINING=3, ST_BEFORE_SPIN=4, ST_FINAL_SPIN=5 };
+Stage savedStage = ST_IDLE;
+int savedCycle = 0;
+int savedRound = 0;
+
+// ----------------- Helpers -----------------
+void onPin(int p)  { digitalWrite(p, LOW); }
+void offPin(int p) { digitalWrite(p, HIGH); }
+
+void allOff() {
+  offPin(RELAY_INLET);
+  offPin(RELAY_DRAIN);
+  offPin(RELAY_FWD);
+  offPin(RELAY_REV);
+}
+
+void waitChunk(unsigned long ms) {
+  unsigned long t = millis();
+  while (millis() - t < ms) delay(1);
+}
+
+// ----------------- OLED display -----------------
+void show(const String &title, const String &sub = "") {
+  // Reset render state to avoid alignment issues (fix WASHING R1)
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  // Title (big)
+  display.setTextSize(2);
+  int16_t x1,y1; uint16_t w,h;
+  display.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 0);
+  display.println(title);
+
+  // Subtitle
+  display.setTextSize(1);
+  display.getTextBounds(sub, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 22);
+  display.println(sub);
+
+  // Pressure & threshold
+  display.setCursor(0, 40);
+  display.print("Pressure: ");
+  display.println(pressure);
+  display.setCursor(0, 52);
+  display.print("Threshold: ");
+  display.println(threshold);
+
+  display.display();
+}
+
+// ----------------- Button debounce -----------------
+bool debounceButton(int pin) {
+  if (digitalRead(pin) == LOW) {
+    delay(10);
+    if (digitalRead(pin) == LOW) {
+      while (digitalRead(pin) == LOW) delay(10);
+      delay(10);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool startPressed() { return debounceButton(BTN_START); }
+
+// ----------------- HX710B hybrid read -----------------
+long readPressure() {
+  unsigned long t0 = millis();
+  bool ready = false;
+
+  // Wait only up to 3 ms (gives a chance to become ready but avoids blocking)
+  while (millis() - t0 < 3) {
+    if (digitalRead(HX_DOUT) == LOW) { ready = true; break; }
+  }
+
+  if (!ready) return lastRawPressure;
+
+  uint32_t count = 0;
+  for (int i=0;i<24;i++) {
+    digitalWrite(HX_SCK, HIGH); delayMicroseconds(2);
+    count <<= 1;
+    digitalWrite(HX_SCK, LOW); delayMicroseconds(2);
+    if (digitalRead(HX_DOUT)) count++;
+  }
+  // gain pulse
+  digitalWrite(HX_SCK, HIGH); delayMicroseconds(2);
+  digitalWrite(HX_SCK, LOW);
+
+  if (count & 0x800000) count |= 0xFF000000;
+  lastRawPressure = (long)count;
+  return lastRawPressure;
+}
+
+// ----------------- Motor pattern -----------------
+void motorPattern() {
+  onPin(RELAY_FWD);
+  waitChunk(fwdTime);
+
+  allOff();
+  waitChunk(pause1Time);
+
+  onPin(RELAY_REV);
+  waitChunk(revPulseTime);
+
+  onPin(RELAY_FWD);
+  onPin(RELAY_REV);
+  waitChunk(revFullTime);
+
+  allOff();
+  waitChunk(pause2Time);
+}
+
+// ----------------- Preferences helpers -----------------
+void saveState(Stage s, int cycle, int round) {
+  prefs.begin("washer", false);
+  prefs.putBool("has", true);
+  prefs.putUInt("stage", (uint32_t)s);
+  prefs.putInt("cycle", cycle);
+  prefs.putInt("round", round);
+  prefs.end();
+}
+
+bool loadState(Stage &s, int &cycle, int &round) {
+  prefs.begin("washer", true);
+  bool has = prefs.getBool("has", false);
+  if (!has) { prefs.end(); return false; }
+  uint32_t st = prefs.getUInt("stage", 0);
+  s = (Stage)st;
+  cycle = prefs.getInt("cycle", 0);
+  round = prefs.getInt("round", 0);
+  prefs.end();
+  return true;
+}
+
+void clearState() {
+  prefs.begin("washer", false);
+  prefs.clear();
+  prefs.end();
+}
+
+// ----------------- Setup -----------------
 void setup() {
-  for (int i = 0; i < 4; i++) {
-    pinMode(espPins[i], INPUT);
-    pinMode(relayPins[i], OUTPUT);
-    digitalWrite(relayPins[i], HIGH); // Relay OFF initially (low trigger)
+  Serial.begin(115200);
+  delay(200);
+
+  // OLED initialization exactly like your working test
+  Wire.begin(21, 22);
+  delay(100);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED INIT FAIL");
+    while (true) delay(1000);
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.display();
+  delay(50);
+
+  // GPIOs
+  pinMode(RELAY_INLET, OUTPUT);
+  pinMode(RELAY_DRAIN, OUTPUT);
+  pinMode(RELAY_FWD, OUTPUT);
+  pinMode(RELAY_REV, OUTPUT);
+  allOff();
+
+  pinMode(BTN_START, INPUT_PULLUP);
+  pinMode(BTN_STOP, INPUT_PULLUP);
+
+  pinMode(HX_SCK, OUTPUT);
+  pinMode(HX_DOUT, INPUT);
+  delay(800);
+
+  // Load saved state if present
+  if (loadState(savedStage, savedCycle, savedRound)) {
+    Serial.printf("Saved state found: stage=%d cycle=%d round=%d\n", (int)savedStage, savedCycle, savedRound);
+
+    // Show resume countdown and allow STOP to cancel
+    for (int i = 5; i >= 1; --i) {
+      // Force a clear screen and show countdown frame (guarantees OLED visible)
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setCursor(6, 0);
+      display.println("RESUME?");
+      display.setTextSize(1);
+      display.setCursor(6, 28);
+      display.print("Resuming in ");
+      display.print(i);
+      display.println("s");
+      display.setCursor(6, 44);
+      display.print("Press STOP to cancel");
+      display.display();
+
+      // allow user to cancel resume via STOP
+      if (digitalRead(BTN_STOP) == LOW) {
+        // wait for release
+        while (digitalRead(BTN_STOP) == LOW) delay(10);
+        clearState();
+        savedStage = ST_IDLE;
+        savedCycle = 0;
+        savedRound = 0;
+        show("READY", "Press START");
+        Serial.println("Resume canceled by user.");
+        pressure = lastRawPressure = readPressure();
+        return; // normal startup
+      }
+      delay(1000);
+    }
+
+    // After countdown, force a short "resuming" screen so OLED is active
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(10, 0);
+    display.println("RESUMING");
+    display.setTextSize(1);
+    display.setCursor(10, 28);
+    display.println("Please wait...");
+    display.display();
+    delay(300);
+
+    // ensure pressure initialized
+    pressure = lastRawPressure = readPressure();
+    Serial.println("Auto-resume will proceed now.");
+    // savedStage/savedCycle/savedRound remain as loaded and loop() will handle resume
+  } else {
+    // normal boot
+    pressure = lastRawPressure = readPressure();
+    show("READY", "Press START");
   }
 }
 
+// ----------------- Main loop -----------------
 void loop() {
-  for (int i = 0; i < 4; i++) {
-    int state = digitalRead(espPins[i]);
-    if (state == HIGH) {
-      digitalWrite(relayPins[i], LOW);   // Turn ON relay (low trigger)
-    } else {
-      digitalWrite(relayPins[i], HIGH);  // Turn OFF relay
+  // STOP is an emergency canceler: clear saved state and restart
+  if (debounceButton(BTN_STOP)) {
+    Serial.println("STOP pressed - clear saved state and restart");
+    clearState();
+    delay(50);
+    ESP.restart();
+  }
+
+  // If savedStage was loaded during setup, it's non-IDLE — resume now
+  if (savedStage != ST_IDLE) {
+    // copy values to local resume variables
+    Stage resumeStage = savedStage;
+    int resumeCycle = savedCycle;
+    int resumeRound = savedRound;
+
+    // clear savedStage to prevent re-entering
+    savedStage = ST_IDLE;
+
+    Serial.printf("Resuming: stage=%d cycle=%d round=%d\n", (int)resumeStage, resumeCycle, resumeRound);
+
+    // Ensure OLED shows a resume header before action (guarantee visible)
+    show("RESUMING", "Please wait...");
+    delay(200);
+
+    // --- Resume logic: handle each possible saved stage ---
+    if (resumeStage == ST_FILLING) {
+      // Resume filling at savedCycle; proceed cycles from there
+      for (int cycle = resumeCycle; cycle <= totalCycles; cycle++) {
+        saveState(ST_FILLING, cycle, 0);
+
+        offPin(RELAY_DRAIN);
+        onPin(RELAY_INLET);
+
+        unsigned long fillStart = millis();
+        unsigned long f0 = millis();
+
+        // Stabilize 1.5s
+        unsigned long stabStart = millis();
+        while (millis() - stabStart < 1500) {
+          pressure = readPressure();
+          show("PREPARING", "Stabilizing...");
+          delay(50);
+        }
+
+        // Prime 5s
+        while (millis() - fillStart < 5000) {
+          pressure = readPressure();
+          show("FILLING", "Please wait...");
+          delay(100);
+        }
+
+        // 10 confirmations
+        int fullConfirm = 0;
+        while (true) {
+          pressure = readPressure();
+          Serial.println(pressure);
+          show("FILLING", "Cycle " + String(cycle));
+          if (pressure > threshold) {
+            fullConfirm++;
+            if (fullConfirm >= 10) break;
+          } else fullConfirm = 0;
+          if (millis() - f0 > fillTimeout) break;
+          if (debounceButton(BTN_STOP)) { clearState(); ESP.restart(); }
+          delay(100);
+        }
+
+        offPin(RELAY_INLET);
+
+        // Proceed to washing for this cycle
+        saveState(ST_WASHING, cycle, 1);
+        for (int r = 1; r <= washRounds; r++) {
+          saveState(ST_WASHING, cycle, r);
+          String sub = "C" + String(cycle) + " R" + String(r);
+          show("WASHING", sub);
+          motorPattern();
+          if (debounceButton(BTN_STOP)) { clearState(); ESP.restart(); }
+        }
+
+        // Draining
+        saveState(ST_DRAINING, cycle, 0);
+        show("DRAINING", "Cycle " + String(cycle));
+        onPin(RELAY_DRAIN);
+        waitChunk(drainTime);
+        offPin(RELAY_DRAIN);
+
+        if (cycle < totalCycles) {
+          show("WAITING", "30 sec");
+          waitChunk(cycleDelay);
+        }
+      }
+
+      // Finish by performing the final spin sequence
+      saveState(ST_BEFORE_SPIN, 0, 0);
+      show("WAITING", "Before Spin");
+      waitChunk(30000);
+
+      saveState(ST_FINAL_SPIN, 0, 0);
+      show("FINAL SPIN", "Drain 10s");
+      onPin(RELAY_DRAIN);
+      waitChunk(spinDrainBefore);
+      show("FINAL SPIN", "Spinning...");
+      onPin(RELAY_FWD);
+      waitChunk(spinTime);
+      show("FINAL SPIN", "Stop Motor");
+      offPin(RELAY_FWD);
+      onPin(RELAY_DRAIN);
+      waitChunk(spinMotorOff);
+      show("FINAL SPIN", "Complete");
+      allOff();
+      waitChunk(spinDrainAfter);
+
+      clearState();
+      show("DONE", "Wash Complete!");
     }
+    else if (resumeStage == ST_WASHING) {
+      // Resume washing from savedCycle and savedRound
+      for (int cycle = resumeCycle; cycle <= totalCycles; cycle++) {
+        int startRound = (cycle == resumeCycle) ? resumeRound : 1;
+        for (int r = startRound; r <= washRounds; r++) {
+          saveState(ST_WASHING, cycle, r);
+          String sub = "C" + String(cycle) + " R" + String(r);
+          show("WASHING", sub);
+          motorPattern();
+          if (debounceButton(BTN_STOP)) { clearState(); ESP.restart(); }
+        }
+
+        // Drain after cycle
+        saveState(ST_DRAINING, cycle, 0);
+        show("DRAINING", "Cycle " + String(cycle));
+        onPin(RELAY_DRAIN);
+        waitChunk(drainTime);
+        offPin(RELAY_DRAIN);
+
+        if (cycle < totalCycles) {
+          show("WAITING", "30 sec");
+          waitChunk(cycleDelay);
+        }
+      }
+
+      // Final spin
+      saveState(ST_BEFORE_SPIN, 0, 0);
+      show("WAITING", "Before Spin");
+      waitChunk(30000);
+
+      saveState(ST_FINAL_SPIN, 0, 0);
+      show("FINAL SPIN", "Drain 10s");
+      onPin(RELAY_DRAIN);
+      waitChunk(spinDrainBefore);
+      show("FINAL SPIN", "Spinning...");
+      onPin(RELAY_FWD);
+      waitChunk(spinTime);
+      show("FINAL SPIN", "Stop Motor");
+      offPin(RELAY_FWD);
+      onPin(RELAY_DRAIN);
+      waitChunk(spinMotorOff);
+      show("FINAL SPIN", "Complete");
+      allOff();
+      waitChunk(spinDrainAfter);
+
+      clearState();
+      show("DONE", "Wash Complete!");
+    }
+    else if (resumeStage == ST_DRAINING) {
+      // If resuming from draining, finish draining then continue normally
+      for (int cycle = resumeCycle; cycle <= totalCycles; cycle++) {
+        saveState(ST_DRAINING, cycle, 0);
+        show("DRAINING", "Cycle " + String(cycle));
+        onPin(RELAY_DRAIN);
+        waitChunk(drainTime);
+        offPin(RELAY_DRAIN);
+
+        if (cycle < totalCycles) {
+          // Next cycle: perform normal filling -> washing for subsequent cycles
+          show("WAITING", "30 sec");
+          waitChunk(cycleDelay);
+
+          // Fill for next cycle
+          saveState(ST_FILLING, cycle+1, 0);
+          offPin(RELAY_DRAIN);
+          onPin(RELAY_INLET);
+          unsigned long fillStart = millis();
+          unsigned long f0 = millis();
+          unsigned long stabStart = millis();
+          while (millis() - stabStart < 1500) {
+            pressure = readPressure();
+            show("PREPARING", "Stabilizing...");
+            delay(50);
+          }
+          while (millis() - fillStart < 5000) {
+            pressure = readPressure();
+            show("FILLING", "Please wait...");
+            delay(100);
+          }
+          int fullConfirm = 0;
+          while (true) {
+            pressure = readPressure();
+            show("FILLING", "Cycle " + String(cycle+1));
+            Serial.println(pressure);
+            if (pressure > threshold) {
+              fullConfirm++;
+              if (fullConfirm >= 10) break;
+            } else fullConfirm = 0;
+            if (millis() - f0 > fillTimeout) break;
+            if (debounceButton(BTN_STOP)) { clearState(); ESP.restart(); }
+            delay(100);
+          }
+          offPin(RELAY_INLET);
+
+          for (int r = 1; r <= washRounds; r++) {
+            saveState(ST_WASHING, cycle+1, r);
+            String sub = "C" + String(cycle+1) + " R" + String(r);
+            show("WASHING", sub);
+            motorPattern();
+            if (debounceButton(BTN_STOP)) { clearState(); ESP.restart(); }
+          }
+        }
+      }
+
+      // Final spin
+      saveState(ST_FINAL_SPIN, 0, 0);
+      show("FINAL SPIN", "Drain 10s");
+      onPin(RELAY_DRAIN);
+      waitChunk(spinDrainBefore);
+      show("FINAL SPIN", "Spinning...");
+      onPin(RELAY_FWD);
+      waitChunk(spinTime);
+      show("FINAL SPIN", "Stop Motor");
+      offPin(RELAY_FWD);
+      onPin(RELAY_DRAIN);
+      waitChunk(spinMotorOff);
+      show("FINAL SPIN", "Complete");
+      allOff();
+      waitChunk(spinDrainAfter);
+
+      clearState();
+      show("DONE", "Wash Complete!");
+    }
+    else {
+      // Unknown or other stage — clear state and return to ready
+      clearState();
+      show("READY", "Press START");
+    }
+
+    // Resume block done. Return to top of loop.
+    return;
+  } // end resume
+
+  // ---------- Normal operation ----------
+  if (startPressed()) {
+    allOff();
+
+    for (int cycle = 1; cycle <= totalCycles; cycle++) {
+      // Save that we are filling this cycle
+      saveState(ST_FILLING, cycle, 0);
+
+      offPin(RELAY_DRAIN);
+      onPin(RELAY_INLET);
+
+      unsigned long fillStart = millis();
+      unsigned long f0 = millis();
+
+      // Stabilize 1.5s
+      unsigned long stabStart = millis();
+      while (millis() - stabStart < 1500) {
+        pressure = readPressure();
+        show("PREPARING", "Stabilizing...");
+        delay(50);
+      }
+
+      // Prime 5s
+      while (millis() - fillStart < 5000) {
+        pressure = readPressure();
+        show("FILLING", "Please wait...");
+        delay(100);
+      }
+
+      // 10 confirmations
+      int fullConfirm = 0;
+      while (true) {
+        pressure = readPressure();
+        Serial.println(pressure);
+        show("FILLING", "Cycle " + String(cycle));
+        if (pressure > threshold) {
+          fullConfirm++;
+          if (fullConfirm >= 10) break;
+        } else fullConfirm = 0;
+        if (millis() - f0 > fillTimeout) break;
+        if (debounceButton(BTN_STOP)) { clearState(); ESP.restart(); }
+        delay(100);
+      }
+
+      offPin(RELAY_INLET);
+
+      // Washing
+      for (int r = 1; r <= washRounds; r++) {
+        saveState(ST_WASHING, cycle, r);
+        String sub = "C" + String(cycle) + " R" + String(r);
+        show("WASHING", sub);
+        motorPattern();
+        if (debounceButton(BTN_STOP)) { clearState(); ESP.restart(); }
+      }
+
+      // Draining
+      saveState(ST_DRAINING, cycle, 0);
+      show("DRAINING", "Cycle " + String(cycle));
+      onPin(RELAY_DRAIN);
+      waitChunk(drainTime);
+      offPin(RELAY_DRAIN);
+
+      if (cycle < totalCycles) {
+        show("WAITING", "30 sec");
+        waitChunk(cycleDelay);
+      }
+    }
+
+    // Before final spin
+    saveState(ST_BEFORE_SPIN, 0, 0);
+    show("WAITING", "Before Spin");
+    waitChunk(30000);
+
+    // Final spin
+    saveState(ST_FINAL_SPIN, 0, 0);
+    show("FINAL SPIN", "Drain 10s");
+    onPin(RELAY_DRAIN);
+    waitChunk(spinDrainBefore);
+
+    show("FINAL SPIN", "Spinning...");
+    onPin(RELAY_FWD);
+    waitChunk(spinTime);
+
+    show("FINAL SPIN", "Stop Motor");
+    offPin(RELAY_FWD);
+    onPin(RELAY_DRAIN);
+    waitChunk(spinMotorOff);
+
+    show("FINAL SPIN", "Complete");
+    allOff();
+    waitChunk(spinDrainAfter);
+
+    clearState();
+    show("DONE", "Wash Complete!");
   }
 }
