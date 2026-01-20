@@ -1,0 +1,211 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <esp_task_wdt.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// =======================================================
+// 1. WIFI & NETWORK SETTINGS
+// =======================================================
+const char* ssid = "Premlal";
+const char* password = "62383349";
+
+IPAddress local_IP(192, 168, 29, 62);
+IPAddress gateway(192, 168, 29, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+WebServer server(80);
+String webStatus = "READY";
+String webSub = "Select Mode";
+
+// =======================================================
+// 2. HARDWARE PINS & TIMINGS
+// =======================================================
+#define BTN_START    32
+#define BTN_STOP     33
+#define RELAY_INLET  23
+#define RELAY_DRAIN  26
+#define RELAY_FWD    27 
+#define RELAY_REV    14 
+#define RELAY_SIGNAL 13 
+
+unsigned long FILL_TIME_MAX  = 6UL * 60UL * 1000UL;
+unsigned long DRAIN_TIME_MAX = 3UL * 60UL * 1000UL;
+unsigned long SPIN_TIME_MAX  = 5UL * 60UL * 1000UL;
+
+int FULL_WASH_CYCLES = 3;
+int FULL_WASH_ROUNDS = 15;
+int AGITATE_ON_TIME  = 10000;
+int AGITATE_REST_TIME = 5000;
+
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+Preferences pref;
+int menuIdx = 0;
+const char* modes[] = {"WASH", "QUICK", "DRAIN", "FILL", "SPIN"};
+
+// =======================================================
+// 3. WEB SERVER HTML
+// =======================================================
+void handleRoot() {
+  String html = "<html><head><meta http-equiv='refresh' content='3'>";
+  html += "<style>body{font-family:sans-serif; background:#222; color:#fff; text-align:center; padding-top:50px;}";
+  html += ".box{border:2px solid #00ff00; display:inline-block; padding:20px; border-radius:15px; background:#333;}";
+  html += "h1{color:#00ff00; margin:0;} h2{font-size:40px; margin:10px 0;} p{font-size:20px; color:#aaa;}</style></head><body>";
+  html += "<div class='box'><h1>WASHING MACHINE</h1>";
+  html += "<p>Mode: " + String(modes[menuIdx]) + "</p>";
+  html += "<h2>" + webStatus + "</h2>";
+  html += "<p>" + webSub + "</p>";
+  html += "</div></body></html>";
+  server.send(200, "text/html", html);
+}
+
+// =======================================================
+// 4. UI & SYSTEM HELPERS
+// =======================================================
+
+void allOff() {
+    digitalWrite(RELAY_INLET, HIGH); digitalWrite(RELAY_DRAIN, HIGH);
+    digitalWrite(RELAY_FWD, HIGH); digitalWrite(RELAY_REV, HIGH);
+    digitalWrite(RELAY_SIGNAL, HIGH);
+}
+
+void triggerSignal(int totalSeconds) {
+    unsigned long start = millis();
+    while (millis() - start < (totalSeconds * 1000UL)) {
+        esp_task_wdt_reset();
+        digitalWrite(RELAY_SIGNAL, LOW); delay(400);
+        digitalWrite(RELAY_SIGNAL, HIGH); delay(400);
+        server.handleClient(); // Keep WiFi responsive during beeps
+    }
+}
+
+void updateDisplay(String status, String sub = "") {
+    webStatus = status; webSub = sub; // Update Web Variables
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1); display.setCursor(0, 0);
+    display.println(modes[menuIdx]);
+    display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+    display.setTextSize(2); display.setCursor(0, 20);
+    display.println(status);
+    display.setTextSize(1); display.setCursor(0, 54);
+    display.println(sub);
+    display.display();
+}
+
+void saveState(int mode, int cycle, int step) {
+    pref.begin("laundry", false);
+    pref.putInt("mode", mode); pref.putInt("cycle", cycle); pref.putInt("step", step);
+    pref.end();
+}
+
+bool smartDelay(unsigned long ms) {
+    unsigned long t = millis();
+    while (millis() - t < ms) {
+        esp_task_wdt_reset();
+        server.handleClient(); // Keep WiFi working during delays
+        if (digitalRead(BTN_STOP) == LOW) {
+            allOff(); pref.begin("laundry", false); pref.putInt("mode", -1); pref.end();
+            return true; 
+        }
+        delay(10);
+    }
+    return false;
+}
+
+// =======================================================
+// 5. CORE OPERATIONS (Standard as previous)
+// =======================================================
+
+bool runFill() { updateDisplay("FILLING", "Inlet Valve"); digitalWrite(RELAY_INLET, LOW); bool s = smartDelay(FILL_TIME_MAX); digitalWrite(RELAY_INLET, HIGH); return !s; }
+bool runDrain() { updateDisplay("DRAINING", "Pump Active"); digitalWrite(RELAY_DRAIN, LOW); bool s = smartDelay(DRAIN_TIME_MAX); digitalWrite(RELAY_DRAIN, HIGH); return !s; }
+
+bool runSpin() {
+    updateDisplay("SPIN", "Pump Lead"); digitalWrite(RELAY_DRAIN, LOW);
+    if (smartDelay(5000)) return false;
+    updateDisplay("SPIN", "Motor ON"); digitalWrite(RELAY_REV, HIGH); delay(150); 
+    digitalWrite(RELAY_FWD, LOW); if (smartDelay(SPIN_TIME_MAX)) return false;
+    allOff(); return true;
+}
+
+bool runAgitate(int rounds, String cycleInfo) {
+    for (int r = 1; r <= rounds; r++) {
+        String roundInfo = "Rnd " + String(r) + "/" + String(rounds);
+        digitalWrite(RELAY_REV, HIGH); delay(150);
+        updateDisplay("WASH FWD", cycleInfo + " " + roundInfo);
+        digitalWrite(RELAY_FWD, LOW); if (smartDelay(AGITATE_ON_TIME)) return false;
+        digitalWrite(RELAY_FWD, HIGH); if (smartDelay(AGITATE_REST_TIME)) return false;
+        digitalWrite(RELAY_REV, LOW); delay(150);
+        updateDisplay("WASH REV", cycleInfo + " " + roundInfo);
+        digitalWrite(RELAY_FWD, LOW); if (smartDelay(AGITATE_ON_TIME)) return false;
+        digitalWrite(RELAY_FWD, HIGH); digitalWrite(RELAY_REV, HIGH);
+        if (smartDelay(AGITATE_REST_TIME)) return false;
+    }
+    return true;
+}
+
+void executeSelection(int startCycle = 0, int startStep = 0) {
+    int totalCycles = (menuIdx <= 1) ? 3 : 1;
+    int rounds = (menuIdx == 0) ? 15 : 5;
+    if (menuIdx <= 1) { 
+        for (int i = startCycle; i < totalCycles; i++) {
+            String cStr = "Cycle " + String(i+1) + "/" + String(totalCycles);
+            if (startStep <= 1) { saveState(menuIdx, i, 1); if (!runFill()) return; }
+            if (startStep <= 2) { saveState(menuIdx, i, 2); if (!runAgitate(rounds, cStr)) return; }
+            if (startStep <= 3) { saveState(menuIdx, i, 3); if (!runDrain()) return; }
+            startStep = 0; 
+        }
+        saveState(menuIdx, 0, 4); if (!runSpin()) return;
+        updateDisplay("DONE", "Remove Clothes"); triggerSignal(30); 
+    } else {
+        if (menuIdx == 2) runDrain(); else if (menuIdx == 3) runFill(); else if (menuIdx == 4) runSpin();
+        updateDisplay("DONE", "Task Complete"); triggerSignal(5);
+    }
+    pref.begin("laundry", false); pref.putInt("mode", -1); pref.end(); allOff();
+}
+
+// =======================================================
+// 6. SETUP & LOOP
+// =======================================================
+
+void setup() {
+    digitalWrite(RELAY_SIGNAL, LOW); pinMode(RELAY_SIGNAL, OUTPUT); 
+
+    // Start WiFi
+    if (!WiFi.config(local_IP, gateway, subnet)) { }
+    WiFi.begin(ssid, password);
+    
+    // OLED & Pins
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { for(;;); }
+    display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+    pinMode(BTN_START, INPUT_PULLUP); pinMode(BTN_STOP, INPUT_PULLUP);
+    pinMode(RELAY_INLET, OUTPUT); pinMode(RELAY_DRAIN, OUTPUT);
+    pinMode(RELAY_FWD, OUTPUT); pinMode(RELAY_REV, OUTPUT);
+    allOff();
+
+    // Web Server
+    server.on("/", handleRoot);
+    server.begin();
+
+    // Startup Pips
+    for(int i=0; i<3; i++) { digitalWrite(RELAY_SIGNAL, LOW); delay(200); digitalWrite(RELAY_SIGNAL, HIGH); delay(200); }
+    
+    updateDisplay("READY", "WiFi: .62");
+}
+
+void loop() {
+    server.handleClient();
+    if (digitalRead(BTN_STOP) == LOW) {
+        digitalWrite(RELAY_SIGNAL, LOW); delay(80); digitalWrite(RELAY_SIGNAL, HIGH);
+        delay(200); menuIdx = (menuIdx + 1) % 5;
+        updateDisplay(modes[menuIdx], "Press START");
+        while(digitalRead(BTN_STOP) == LOW) server.handleClient();
+    }
+    if (digitalRead(BTN_START) == LOW) {
+        digitalWrite(RELAY_SIGNAL, LOW); delay(150); digitalWrite(RELAY_SIGNAL, HIGH);
+        delay(200); executeSelection();
+        updateDisplay("READY", "Select Mode");
+    }
+}
